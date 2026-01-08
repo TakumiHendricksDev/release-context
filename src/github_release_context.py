@@ -20,16 +20,20 @@ import argparse
 import dataclasses
 import json
 import os
-import re
 import sys
-from collections import defaultdict
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
 from github_service import GithubService
+from github_client import GitHubClient
 from pr_info import PRInfo
+from fetchers import CompareFetcher, PRFetcher
+from enrich import group_prs
+from renderers import MarkdownRenderer, JsonRenderer
+from parallel_fetcher import ParallelFetcher
 
 # Optional fancy progress bar
 try:
@@ -43,25 +47,34 @@ PR_NUMBER_PATTERNS = [
     re.compile(r"pull request #(\d+)\b", re.I),
 ]
 
-DEFAULT_LABEL_GROUPS = [
-    ("breaking", {"breaking", "breaking-change", "semver-major"}),
-    ("security", {"security"}),
-    ("bugfix", {"bug", "bugfix", "fix"}),
-    ("feature", {"feature", "enhancement"}),
-    ("performance", {"performance", "perf"}),
-    ("docs", {"documentation", "docs"}),
-    ("deps", {"dependencies", "deps"}),
-    ("chore", {"chore", "maintenance", "refactor"}),
-    ("test", {"test", "testing"}),
-]
+@dataclasses.dataclass
+class Config:
+    repo: str
+    from_ref: str
+    to_ref: str
+    out_dir: str
+    include_pr_files: bool
+    max_pr_files: int
+    env_file: str
+    summary_max_chars: int
+    files_shown: int
+    risk_max_items: int
+    commit_fallback_max: int
+    include_pr_reviews: bool
+    include_pr_comments: bool
+    include_pr_checks: bool
+    max_concurrent_requests: int
+    min_file_lines: int
 
-def parse_repo(repo: str) -> Tuple[str, str]:
+
+def parse_repo(repo: str) -> tuple[str, str]:
     if "/" not in repo:
         raise ValueError("--repo must be like owner/name")
     owner, name = repo.split("/", 1)
     return owner, name
 
-def extract_pr_number(commit_message: str) -> Optional[int]:
+
+def extract_pr_number(commit_message: str) -> int | None:
     for pat in PR_NUMBER_PATTERNS:
         m = pat.search(commit_message or "")
         if m:
@@ -72,7 +85,7 @@ def extract_pr_number(commit_message: str) -> Optional[int]:
     return None
 
 
-def progress_iter(iterable, total: Optional[int] = None, desc: Optional[str] = None):
+def progress_iter(iterable, total: int | None = None, desc: str | None = None):
     """Wrap an iterable with a progress indicator, if possible."""
     if tqdm:
         return tqdm(iterable, total=total, desc=desc)
@@ -104,84 +117,6 @@ def progress_iter(iterable, total: Optional[int] = None, desc: Optional[str] = N
     return _SimpleProgress(iterable, total, desc)
 
 
-def group_for_labels(labels: List[str]) -> str:
-    s = {l.lower() for l in labels}
-    for group, labelset in DEFAULT_LABEL_GROUPS:
-        if s.intersection(labelset):
-            return group
-    # fallback heuristic
-    if any("break" in l for l in s):
-        return "breaking"
-    if any("fix" in l or "bug" in l for l in s):
-        return "bugfix"
-    if any("doc" in l for l in s):
-        return "docs"
-    if any("dep" in l for l in s):
-        return "deps"
-    return "other"
-
-
-def _strip_html_preserve_links(text: str) -> str:
-    """Basic HTML to plain text conversion.
-    - Converts <a href="url">label</a> to 'label (url)'.
-    - Replaces <br> and block tags with newlines.
-    - Removes other tags.
-    """
-    t = text or ""
-    # Normalize line breaks from <br> and <p>/<div>/li
-    t = re.sub(r"<\s*br\s*/?\s*>", "\n", t, flags=re.I)
-    t = re.sub(r"</\s*(p|div|li|h\d)\s*>", "\n", t, flags=re.I)
-    # Anchor tags -> label (url)
-    def _a_sub(m: re.Match[str]) -> str:
-        url = m.group(1).strip()
-        label = (m.group(2) or url).strip()
-        return f"{label} ({url})"
-    t = re.sub(r"<\s*a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</\s*a\s*>", _a_sub, t, flags=re.I | re.S)
-    # Remove all remaining tags
-    t = re.sub(r"<[^>]+>", "", t)
-    # Decode common HTML entities (minimal set)
-    t = t.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    # Collapse excessive blank lines
-    t = re.sub(r"\r\n", "\n", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
-
-
-def _safe_truncate(text: str, max_chars: int) -> str:
-    """Truncate at a sensible boundary without breaking words or code fences.
-    - Prefers cutting at sentence boundary or newline.
-    - Ensures backtick fences are balanced in the snippet.
-    """
-    t = text.strip()
-    if len(t) <= max_chars:
-        return t
-    cutoff = max_chars
-    # Prefer last newline before cutoff
-    nl = t.rfind("\n", 0, cutoff)
-    dot = t.rfind(". ", 0, cutoff)
-    space = t.rfind(" ", 0, cutoff)
-    candidate = max(nl, dot, space)
-    if candidate > max_chars // 2:
-        cutoff = candidate
-    snip = t[:cutoff].rstrip()
-    # Balance triple backticks if present
-    fences = snip.count("```")
-    if fences % 2 == 1:
-        snip += "\n```"
-    # Balance single backticks (best-effort)
-    if snip.count("`") % 2 == 1:
-        snip += "`"
-    return snip + "\n…(truncated)…"
-
-
-def summarize_text(text: str, max_chars: int = 600) -> str:
-    # Convert HTML-heavy PR bodies to readable plain text first
-    cleaned = _strip_html_preserve_links(text or "")
-    # Normalize whitespace
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return _safe_truncate(cleaned, max_chars)
-
-
 def load_env(env_file: str) -> None:
     """
     Load environment variables from a .env file.
@@ -195,7 +130,7 @@ def load_env(env_file: str) -> None:
         print(f"[env] No env file found at: {env_file} (skipping)", file=sys.stderr)
 
 
-def main() -> int:
+def build_config() -> Config:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True, help="owner/name")
     ap.add_argument("--from", dest="from_ref", required=True, help="from tag/sha")
@@ -204,224 +139,170 @@ def main() -> int:
     ap.add_argument("--include-pr-files", action="store_true", help="fetch PR file lists (slower)")
     ap.add_argument("--max-pr-files", type=int, default=200, help="max files per PR to fetch")
     ap.add_argument("--env-file", default=".env", help="path to .env file (default: ./.env)")
-    # New tunables
     ap.add_argument("--summary-max-chars", type=int, default=700, help="max characters for sanitized PR body snippets")
     ap.add_argument("--files-shown", type=int, default=25, help="max files listed per PR in Markdown")
     ap.add_argument("--risk-max-items", type=int, default=60, help="max risky file paths to show in heuristic section")
     ap.add_argument("--commit-fallback-max", type=int, default=200, help="max commits to list when no PRs are detected")
+    ap.add_argument("--include-pr-reviews", action="store_true", help="include PR reviews (adds API calls)")
+    ap.add_argument("--include-pr-comments", action="store_true", help="include PR review comments (adds API calls)")
+    ap.add_argument("--include-pr-checks", action="store_true", help="include PR check runs via head SHA (adds API calls)")
+    ap.add_argument("--max-concurrent-requests", type=int, default=10, help="max concurrent API requests (default: 10)")
+    ap.add_argument("--min-file-lines", type=int, default=10, help="min lines changed to include file in JSON output (default: 10)")
     args = ap.parse_args()
+    return Config(
+        repo=args.repo,
+        from_ref=args.from_ref,
+        to_ref=args.to_ref,
+        out_dir=args.out_dir,
+        include_pr_files=args.include_pr_files,
+        max_pr_files=args.max_pr_files,
+        env_file=args.env_file,
+        summary_max_chars=args.summary_max_chars,
+        files_shown=args.files_shown,
+        risk_max_items=args.risk_max_items,
+        commit_fallback_max=args.commit_fallback_max,
+        include_pr_reviews=args.include_pr_reviews,
+        include_pr_comments=args.include_pr_comments,
+        include_pr_checks=args.include_pr_checks,
+        max_concurrent_requests=args.max_concurrent_requests,
+        min_file_lines=args.min_file_lines,
+    )
 
-    load_env(args.env_file)
+
+def make_client(cfg: Config) -> GitHubClient:
+    owner, name = parse_repo(cfg.repo)
+    return GithubService(owner, name, cfg.from_ref, cfg.to_ref)
+
+
+def main() -> int:
+    cfg = build_config()
+    load_env(cfg.env_file)
 
     token = os.getenv("GITHUB_TOKEN")
     if not token:
-        print(
-            "Missing GITHUB_TOKEN. Put it in .env or export it.\n"
-            "Example .env:\n"
-            "  GITHUB_TOKEN=ghp_...\n",
-            file=sys.stderr,
-        )
+        print("Missing GITHUB_TOKEN. Put it in .env or export it.", file=sys.stderr)
         return 2
 
-    # Get repo owner/name from args
-    owner, name = parse_repo(args.repo)
+    client = make_client(cfg)
+    compare_fetcher = CompareFetcher(client)
+    pr_fetcher = PRFetcher(client)
+    parallel_fetcher = ParallelFetcher(max_concurrent=cfg.max_concurrent_requests)
 
-    # Prepare output dir (Defaults to "out")
-    out_dir = args.out_dir
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Setup gh service class
-    gs = GithubService(owner, name, args.from_ref, args.to_ref)
-
-    compare_url = gs.get_compare_url()
-    compare = gs.gh_get(compare_url, token).json()
-
+    compare = compare_fetcher.fetch(token)
     commits = compare.get("commits", [])
-    files = compare.get("files", [])  # compare-level file list (may be truncated for large diffs)
+    compare_files = compare.get("files", [])
 
-    prs: Dict[int, PRInfo] = {}
+    # First pass: Extract PR numbers from commit messages (no API calls)
     commit_entries: List[Dict[str, Any]] = []
+    commits_needing_lookup: List[str] = []
+    sha_to_pr: Dict[str, Optional[int]] = {}
 
-    for c in progress_iter(commits, total=len(commits), desc="Commits"):
+    for c in commits:
         sha = c.get("sha")
         msg = (c.get("commit", {}) or {}).get("message", "")
         author = ((c.get("commit", {}) or {}).get("author", {}) or {}).get("name")
         date = ((c.get("commit", {}) or {}).get("author", {}) or {}).get("date")
 
         pr_number = extract_pr_number(msg)
-        # If commit message didn't include a PR number, try the commit->pulls API
         if not pr_number and sha:
-            try:
-                pulls = gs.gh_get_commit_pulls(sha, token)
-                if pulls:
-                    pr_number = pulls[0].get("number")
-            except Exception as e:
-                print(f"[warn] commit->pulls lookup failed for {sha}: {e}", file=sys.stderr)
+            commits_needing_lookup.append(sha)
+            sha_to_pr[sha] = None
+        else:
+            sha_to_pr[sha] = pr_number
 
         commit_entries.append(
             {"sha": sha, "message": msg.split("\n", 1)[0], "author": author, "date": date, "pr_number": pr_number}
         )
 
-        if pr_number and pr_number not in prs:
-            pr_url = gs.get_pr_url(pr_number)
-            print(f"[fetch] PR #{pr_number} details...", file=sys.stderr)
-            pr = gs.gh_get(pr_url, token).json()
-            labels = [l["name"] for l in pr.get("labels", []) if "name" in l]
+    # Batch fetch commit->pulls for commits missing PR numbers
+    if commits_needing_lookup:
+        print(f"[info] Looking up PR numbers for {len(commits_needing_lookup)} commits...", file=sys.stderr)
+        lookup_results = parallel_fetcher.fetch_commit_pr_numbers(client, commits_needing_lookup, token, pr_fetcher)
+        sha_to_pr.update(lookup_results)
+        # Update commit_entries with found PR numbers
+        for entry in commit_entries:
+            if not entry["pr_number"] and entry["sha"] in sha_to_pr:
+                entry["pr_number"] = sha_to_pr[entry["sha"]]
+
+    # Collect unique PR numbers
+    unique_pr_numbers = set()
+    for entry in commit_entries:
+        if entry["pr_number"]:
+            unique_pr_numbers.add(entry["pr_number"])
+
+    # Batch fetch PR details in parallel
+    prs: Dict[int, PRInfo] = {}
+    if unique_pr_numbers:
+        print(f"[info] Fetching {len(unique_pr_numbers)} PR details...", file=sys.stderr)
+        pr_data_map = parallel_fetcher.fetch_pr_details(client, list(unique_pr_numbers), token, pr_fetcher)
+
+        # Build PRInfo objects and fetch extras in parallel
+        pr_extras_tasks: List[Tuple[int, Optional[str]]] = []
+        for pr_number, pr_data in pr_data_map.items():
+            labels = [l["name"] for l in pr_data.get("labels", []) if "name" in l]
+            head_sha = ((pr_data.get("head", {}) or {}).get("sha", "")) or None
             pr_info = PRInfo(
                 number=pr_number,
-                title=pr.get("title", ""),
-                body=pr.get("body") or "",
-                url=pr.get("html_url", ""),
-                user=(pr.get("user", {}) or {}).get("login", ""),
-                merged_at=pr.get("merged_at"),
+                title=pr_data.get("title", ""),
+                body=pr_data.get("body") or "",
+                url=pr_data.get("html_url", ""),
+                user=(pr_data.get("user", {}) or {}).get("login", ""),
+                merged_at=pr_data.get("merged_at"),
                 labels=labels,
-                base_ref=((pr.get("base", {}) or {}).get("ref", "")),
-                head_ref=((pr.get("head", {}) or {}).get("ref", "")),
+                base_ref=((pr_data.get("base", {}) or {}).get("ref", "")),
+                head_ref=((pr_data.get("head", {}) or {}).get("ref", "")),
+                head_sha=head_sha,
             )
-
-            if args.include_pr_files:
-                pr_files_url = gs.get_files_url(pr_number)
-                print(f"[fetch] PR #{pr_number} files...", file=sys.stderr)
-                pr_files: List[Dict[str, Any]] = []
-                page = 1
-                per_page = 100
-                while len(pr_files) < args.max_pr_files:
-                    batch = gs.gh_get(pr_files_url, token, params={"page": page, "per_page": per_page}).json()
-                    if not batch:
-                        break
-                    pr_files.extend(batch)
-                    if len(batch) < per_page:
-                        break
-                    page += 1
-                pr_info.files = pr_files[: args.max_pr_files]
-
             prs[pr_number] = pr_info
+            pr_extras_tasks.append((pr_number, head_sha))
 
-    # Group PRs
-    grouped: Dict[str, List[PRInfo]] = defaultdict(list)
-    for pr in prs.values():
-        grouped[group_for_labels(pr.labels)].append(pr)
+        # Fetch extras (files, reviews, comments, checks) in parallel per PR
+        if pr_extras_tasks and (cfg.include_pr_files or cfg.include_pr_reviews or cfg.include_pr_comments or cfg.include_pr_checks):
+            print(f"[info] Fetching PR extras (files/reviews/comments/checks)...", file=sys.stderr)
+            for pr_number, head_sha in progress_iter(pr_extras_tasks, total=len(pr_extras_tasks), desc="PR extras"):
+                extras = parallel_fetcher.fetch_pr_extras(
+                    pr_number,
+                    head_sha,
+                    token,
+                    pr_fetcher,
+                    cfg.include_pr_files,
+                    cfg.include_pr_reviews,
+                    cfg.include_pr_comments,
+                    cfg.include_pr_checks,
+                    cfg.max_pr_files,
+                )
+                if "files" in extras:
+                    prs[pr_number].files = extras["files"]
+                if "reviews" in extras:
+                    prs[pr_number].reviews = extras["reviews"]
+                if "comments" in extras:
+                    prs[pr_number].comments = extras["comments"]
+                if "check_runs" in extras:
+                    prs[pr_number].check_runs = extras["check_runs"]
 
-    # Make Markdown
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    md_lines: List[str] = []
-    md_lines.append(f"# Release context: {owner}/{name}")
-    md_lines.append("")
-    md_lines.append(f"- Range: `{args.from_ref}` → `{args.to_ref}`")
-    md_lines.append(f"- Generated: {now}")
-    md_lines.append(f"- Commits in range: **{len(commits)}**")
-    md_lines.append(f"- PRs detected: **{len(prs)}**")
-    md_lines.append("")
+    grouped = group_prs(list(prs.values()))
+    generated_at = datetime.now(timezone.utc)
 
-    # High-level compare file stats
-    if files:
-        additions = sum(f.get("additions", 0) for f in files)
-        deletions = sum(f.get("deletions", 0) for f in files)
-        changed_files = len(files)
-        md_lines.append("## Diff stats (compare endpoint)")
-        md_lines.append(f"- Files changed: **{changed_files}**")
-        md_lines.append(f"- Additions: **{additions}** | Deletions: **{deletions}**")
-        md_lines.append("")
+    md_renderer = MarkdownRenderer(
+        summary_max_chars=cfg.summary_max_chars,
+        files_shown=cfg.files_shown,
+        risk_max_items=cfg.risk_max_items,
+        commit_fallback_max=cfg.commit_fallback_max,
+    )
+    json_renderer = JsonRenderer(summary_max_chars=cfg.summary_max_chars, min_file_lines=cfg.min_file_lines)
 
-    # Risks / flags (simple heuristics)
-    risk_flags: List[str] = []
-    risky_paths = [
-        r"migrations/",
-        r"schema",
-        r"docker",
-        r"helm",
-        r"k8s",
-        r"terraform",
-        r"\.github/workflows",
-        r"settings",
-        r"config",
-        r"requirements",
-        r"package-lock\.json",
-        r"pnpm-lock\.yaml",
-        r"yarn\.lock",
-        r"poetry\.lock",
-    ]
-    risky_re = re.compile("|".join(risky_paths), re.I)
-    for f in files:
-        fn = f.get("filename", "")
-        if risky_re.search(fn):
-            risk_flags.append(fn)
+    owner, name = parse_repo(cfg.repo)
+    md_content = md_renderer.render(owner, name, cfg.from_ref, cfg.to_ref, generated_at, commit_entries, grouped, compare_files)
+    json_content = json_renderer.render(cfg.repo, cfg.from_ref, cfg.to_ref, generated_at, compare, commit_entries, list(prs.values()), compare_files)
 
-    if risk_flags:
-        md_lines.append("## Potential impact areas (heuristic)")
-        md_lines.append("These files suggest higher-risk changes (migrations/config/CI/deps):")
-        for fn in sorted(set(risk_flags))[: args.risk_max_items]:
-            md_lines.append(f"- `{fn}`")
-        if len(set(risk_flags)) > args.risk_max_items:
-            md_lines.append(f"- …and {len(set(risk_flags)) - args.risk_max_items} more")
-        md_lines.append("")
-
-    # PR sections (ordered)
-    section_order = ["breaking", "security", "feature", "bugfix", "performance", "deps", "docs", "chore", "test", "other"]
-    pr_json_list: List[Dict[str, Any]] = []
-    for section in section_order:
-        prs_in_section = sorted(grouped.get(section, []), key=lambda p: p.number)
-        if not prs_in_section:
-            continue
-        md_lines.append(f"## {section.capitalize()}")
-        for pr in prs_in_section:
-            md_lines.append(f"- #{pr.number} — {pr.title} (@{pr.user})")
-            if pr.labels:
-                md_lines.append(f"  - Labels: {', '.join(pr.labels)}")
-            md_lines.append(f"  - URL: {pr.url}")
-            body_snip = summarize_text(pr.body, args.summary_max_chars)
-            if body_snip:
-                md_lines.append("  - Notes:")
-                for line in body_snip.split("\n"):
-                    md_lines.append(f"    - {line}")
-            if pr.files:
-                touched = [pf.get("filename") for pf in pr.files if pf.get("filename")]
-                if touched:
-                    md_lines.append(f"  - Files touched ({min(len(touched), args.files_shown)} shown):")
-                    for fn in touched[: args.files_shown]:
-                        md_lines.append(f"    - `{fn}`")
-                    if len(touched) > args.files_shown:
-                        md_lines.append(f"    - …and {len(touched) - args.files_shown} more")
-            # Build JSON entry with sanitized snippet
-            pr_entry = dataclasses.asdict(pr)
-            pr_entry["body_sanitized"] = _strip_html_preserve_links(pr.body or "")
-            pr_entry["body_snippet"] = summarize_text(pr.body or "", args.summary_max_chars)
-            pr_json_list.append(pr_entry)
-        md_lines.append("")
-
-    # If no PRs found, fall back to commits
-    if not prs:
-        md_lines.append("## Commits (no PRs detected)")
-        for ce in commit_entries[: args.commit_fallback_max]:
-            md_lines.append(f"- {ce['sha'][:8]} — {ce['message']}")
-        if len(commit_entries) > args.commit_fallback_max:
-            md_lines.append(f"- …and {len(commit_entries) - args.commit_fallback_max} more")
-        md_lines.append("")
-
-    # JSON artifact
-    artifact = {
-        "repo": args.repo,
-        "from": args.from_ref,
-        "to": args.to_ref,
-        "generated_at": now,
-        "compare": {
-            "ahead_by": compare.get("ahead_by"),
-            "behind_by": compare.get("behind_by"),
-            "total_commits": compare.get("total_commits"),
-            "html_url": compare.get("html_url"),
-        },
-        "commits": commit_entries,
-        "prs": sorted(pr_json_list, key=lambda x: x["number"]),
-        "compare_files": files,
-    }
-
-    md_path = os.path.join(out_dir, f"release_context_{owner}_{name}_{args.from_ref}_to_{args.to_ref}.md")
-    json_path = os.path.join(out_dir, f"release_context_{owner}_{name}_{args.from_ref}_to_{args.to_ref}.json")
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    md_path = os.path.join(cfg.out_dir, f"release_context_{owner}_{name}_{cfg.from_ref}_to_{cfg.to_ref}.md")
+    json_path = os.path.join(cfg.out_dir, f"release_context_{owner}_{name}_{cfg.from_ref}_to_{cfg.to_ref}.json")
 
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(md_lines).rstrip() + "\n")
+        f.write(md_content)
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(artifact, f, indent=2, ensure_ascii=False)
+        json.dump(json_content, f, indent=2, ensure_ascii=False)
 
     print(f"Wrote:\n- {md_path}\n- {json_path}")
     return 0

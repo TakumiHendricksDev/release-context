@@ -8,7 +8,7 @@ API_BASE = "https://api.github.com"
 UA = "release-context-builder/1.0"
 
 class GithubService:
-    def __init__(self, owner, repo, from_ref, to_ref):
+    def __init__(self, owner: str, repo: str, from_ref: str, to_ref: str):
         self.owner = owner
         self.repo = repo
         self.from_ref = from_ref

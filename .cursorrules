@@ -1,0 +1,173 @@
+# Release Context Builder - Cursor Rules
+
+## Project Overview
+This is a Python tool that builds Markdown and JSON summaries of changes between two git refs using the GitHub API. It's designed for Python 3.11+ and uses modern Python patterns.
+
+## Code Style & Standards
+
+### Python Version & Features
+- **Python 3.11+** required (as specified in `pyproject.toml`)
+- Always use `from __future__ import annotations` at the top of files for forward references
+- Prefer modern Python features (type hints, dataclasses, f-strings, structural typing)
+
+### Type Hints
+- **Always use type hints** for function parameters, return types, and class attributes
+- Use `typing` module types: `Dict`, `List`, `Optional`, `Any`, `Protocol`
+- Use `|` syntax for union types when appropriate (e.g., `int | None`), but `Optional[T]` is also acceptable
+- Use `Protocol` for structural typing/interfaces (see `github_client.py`)
+
+### Imports
+- **Standard library imports first**, then third-party, then local imports
+- Use relative imports for local modules (no package structure)
+- Group imports: stdlib, third-party, local (with blank lines between groups)
+- Import order example:
+  ```python
+  from __future__ import annotations
+  
+  import sys
+  from typing import Optional, Dict, Any
+  
+  import requests
+  
+  from github_client import GitHubClient
+  ```
+
+### Code Organization
+- **Classes** for organizing related functionality (services, fetchers, renderers)
+- **Functions** for utilities and standalone operations
+- **Dataclasses** for data models (use `@dataclasses.dataclass`)
+- **Protocols** for interface definitions (structural typing)
+
+### Naming Conventions
+- **Classes**: PascalCase (e.g., `GithubService`, `MarkdownRenderer`)
+- **Functions**: snake_case (e.g., `extract_pr_number`, `summarize_text`)
+- **Variables**: snake_case (e.g., `pr_number`, `compare_files`)
+- **Constants**: UPPER_SNAKE_CASE (e.g., `API_BASE`, `UA`)
+- **Private functions**: prefix with underscore (e.g., `_strip_html_preserve_links`, `_safe_truncate`)
+
+### Error Handling
+- Use try/except blocks for API calls and operations that can fail
+- Print warnings/errors to `sys.stderr` (not stdout)
+- Use descriptive error messages
+- Handle rate limiting explicitly (see `github_service.py` for pattern)
+- Use `resp.raise_for_status()` for HTTP responses
+
+### String Formatting
+- **Prefer f-strings** for string formatting
+- Use `.format()` or `%` only when f-strings aren't practical
+- Example: `f"PR #{pr_number} — {pr.title}"`
+
+### Data Structures
+- Use **dataclasses** for structured data (see `PRInfo`, `Config`)
+- Use **defaultdict** when appropriate (see `enrich.py`)
+- Prefer list/dict comprehensions when readable
+
+### API & Network Code
+- Always set appropriate **timeouts** (e.g., `timeout=60`)
+- Handle **rate limiting** explicitly (check `X-RateLimit-Remaining` header)
+- Use proper **User-Agent** headers
+- Include proper **Accept** headers for GitHub API
+- Use `Bearer` token authentication
+
+### File I/O
+- Always specify `encoding="utf-8"` when opening files
+- Use context managers (`with` statements) for file operations
+- Create output directories with `os.makedirs(path, exist_ok=True)`
+
+### Progress Indicators
+- Support optional `tqdm` for progress bars
+- Provide fallback simple progress indicator if `tqdm` unavailable
+- Print progress to `sys.stderr` (not stdout)
+
+### Text Processing
+- Sanitize HTML content (strip tags, preserve links)
+- Use regex for pattern matching (compile patterns when reused)
+- Handle text truncation intelligently (prefer sentence/word boundaries)
+- Balance markdown code fences and backticks when truncating
+
+### Testing
+- Write tests in `tests/` directory
+- Use **pytest** for testing
+- Test functions should be named `test_*`
+- Use descriptive test names (e.g., `test_strip_html_preserve_links_basic`)
+- Test both happy paths and edge cases
+- Use fixtures from `conftest.py` when appropriate
+
+## Project Structure
+- **Source code**: `src/` directory
+- **Tests**: `tests/` directory  
+- **Output**: `out/` directory (gitignored)
+- **Configuration**: `pyproject.toml` for dependencies and pytest config
+
+## Dependencies
+- Core: `python-dotenv`, `requests`, `tqdm`
+- Testing: `pytest>=9.0.2`
+- Use `uv` for dependency management (preferred runner)
+
+## CLI Patterns
+- Use `argparse` for command-line arguments
+- Create a `Config` dataclass to hold parsed arguments
+- Validate inputs (e.g., repo format must be `owner/name`)
+- Load environment variables from `.env` file (non-fatal if missing)
+
+## Code Examples
+
+### Class Definition Pattern
+```python
+from __future__ import annotations
+
+from typing import Optional, Dict, Any
+
+class MyService:
+    def __init__(self, param: str):
+        self.param = param
+    
+    def method(self, token: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        ...
+```
+
+### Dataclass Pattern
+```python
+import dataclasses
+from typing import Optional, List
+
+@dataclasses.dataclass
+class MyData:
+    required_field: str
+    optional_field: Optional[str] = None
+    list_field: List[str] = dataclasses.field(default_factory=list)
+```
+
+### Protocol Pattern
+```python
+from typing import Protocol
+
+class MyClient(Protocol):
+    def method(self, param: str) -> str:
+        ...
+```
+
+### Error Handling Pattern
+```python
+try:
+    result = risky_operation()
+except Exception as e:
+    print(f"[warn] operation failed: {e}", file=sys.stderr)
+    # handle gracefully
+```
+
+## When Adding New Features
+- Follow existing patterns for similar functionality
+- Add type hints to all new functions/classes
+- Consider rate limiting for new API calls
+- Add appropriate error handling
+- Update tests if adding new functionality
+- Consider adding CLI flags if behavior should be configurable
+- Document in docstrings if the function is non-trivial
+
+## Code Quality
+- Keep functions focused and single-purpose
+- Prefer composition over inheritance
+- Use meaningful variable names
+- Add comments for non-obvious logic
+- Keep line length reasonable (aim for <100 chars, but be pragmatic)

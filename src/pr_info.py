@@ -13,4 +13,8 @@ class PRInfo:
     labels: List[str]
     base_ref: str
     head_ref: str
+    head_sha: Optional[str] = None
     files: Optional[List[Dict[str, Any]]] = None
+    reviews: Optional[List[Dict[str, Any]]] = None
+    comments: Optional[List[Dict[str, Any]]] = None
+    check_runs: Optional[List[Dict[str, Any]]] = None
