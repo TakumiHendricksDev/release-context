@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.idea
+.DS_Store
+.scratch
+
+# Virtual environments
+.venv
+
+# Output artifacts
+out/
+.env
